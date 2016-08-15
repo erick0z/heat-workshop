@@ -1,0 +1,245 @@
+heat_template_version: 2013-05-23
+
+description: >
+  Heat WordPress template to support Clear Linux, using only Heat OpenStack-native
+  resource types, and without the requirement for heat-cfntools in the image.
+  WordPress is web software you can use to create a beautiful website or blog.
+  This template installs a single-instance WordPress deployment using a local
+  MySQL(MariaDB) database to store the data.
+
+parameters:
+  admin_user:
+      type: string
+      default: admin
+
+  admin_pass:
+      type: string
+      default: secret
+
+  key_name:
+    type: string
+    description : Name of a KeyPair to enable SSH access to the instance
+    default: generic-cloud
+
+  instance_type:
+    type: string
+    description: Instance type for WordPress server
+    default: m1.small
+
+  image_id:
+    type: string
+    description: >
+      Name or ID of the image to use for the WordPress server.
+    default: clearlinux-9890
+
+  db_name:
+    type: string
+    description: WordPress database name
+    default: wordpress
+    constraints:
+      - length: { min: 1, max: 64 }
+        description: db_name must be between 1 and 64 characters
+      - allowed_pattern: '[a-zA-Z][a-zA-Z0-9]*'
+        description: >
+          db_name must begin with a letter and contain only alphanumeric
+          characters
+    default: wordpress
+
+  db_username:
+    type: string
+    description: The WordPress database admin account username
+    default: admin
+    hidden: true
+    constraints:
+      - length: { min: 1, max: 16 }
+        description: db_username must be between 1 and 16 characters
+      - allowed_pattern: '[a-zA-Z][a-zA-Z0-9]*'
+        description: >
+          db_username must begin with a letter and contain only alphanumeric
+          characters
+
+  db_password:
+    type: string
+    description: The WordPress database admin account password
+    default: admin
+    hidden: true
+    constraints:
+      - length: { min: 1, max: 41 }
+        description: db_password must be between 1 and 41 characters
+      - allowed_pattern: '[a-zA-Z0-9]*'
+        description: db_password must contain only alphanumeric characters
+
+  db_root_password:
+    type: string
+    description: Root password for MySQL
+    default: admin
+    hidden: true
+    constraints:
+      - length: { min: 1, max: 41 }
+        description: db_root_password must be between 1 and 41 characters
+      - allowed_pattern: '[a-zA-Z0-9]*'
+        description: db_root_password must contain only alphanumeric characters
+
+resources:
+  wait_condition:
+    type: OS::Heat::WaitCondition
+    depends_on: wordpress_instance
+    properties:
+      handle: { get_resource: wait_handle }
+      count: 1 
+      timeout: 900
+
+  wait_handle:
+    type: OS::Heat::WaitConditionHandle
+
+  security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: "SSH and HTTP for the all in one server"
+      rules: [
+        {remote_ip_prefix: 0.0.0.0/0,
+        protocol: tcp,
+        port_range_min: 22,
+        port_range_max: 22},
+        {remote_ip_prefix: 0.0.0.0/0,
+        protocol: tcp,
+        port_range_min: 80,
+        port_range_max: 80},]
+
+  wordpress_instance_floating_ip:
+    type: OS::Nova::FloatingIP
+    properties:
+      pool: external
+
+  wordpress_instance_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: pueblo
+
+  wordpress_dbserver_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: pueblo
+
+  wordpress_instance:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image_id }
+      flavor: { get_param: instance_type }
+      key_name: { get_param: key_name }
+      networks:
+          - port : { get_resource: wordpress_instance_port }
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash 
+
+            # SWUPD INSTALL OR UPDATE TASKS
+            swupd bundle-add lamp-basic network-basic
+            systemctl start httpd
+            
+            # WORDPRESS SOURCES DOWNLOAD AND SETTINGS
+            mkdir /etc/wordpress /etc/httpd
+            mkdir /etc/httpd/conf.d
+            curl https://wordpress.org/latest.tar.gz | tar xz -C /usr/share
+            cp /usr/share/wordpress/wp-config-sample.php /etc/wordpress/config.php
+            chown -R root:root /usr/share/wordpress/
+            sed -e '/^$debian_file=*/ s/^#*/#/' -i /usr/share/wordpress/wp-config.php
+            sed -i '/#$debian_file =.*/a $debian_file='\''/etc/wordpress/config.php'\'';' /usr/share/wordpress/wp-config.php
+            sed -e '/^$debian_main_file=*/ s/^#*/#/' -i /usr/share/wordpress/wp-config.php
+            sed -i '/#$debian_main_file =.*/a $debian_file='\''/etc/wordpress/config.php'\'';' /usr/share/wordpress/wp-config.php
+            cat <<EOF > /etc/httpd/conf.d/wordpress.conf
+            Alias /wordpress /usr/share/wordpress
+            <Directory /usr/share/wordpress>
+              Options FollowSymLinks
+              AllowOverride Limit Options FileInfo
+              DirectoryIndex index.php
+              Order allow,deny
+              Allow from all
+            </Directory>
+            <Directory /usr/share/wordpress/wp-content>
+              Options FollowSymLinks
+              Order allow,deny
+              Allow from all
+            </Directory>
+            EOF
+            systemctl restart httpd
+
+            sed -i "/Deny from All/d" /etc/httpd/conf.d/wordpress.conf
+            sed -i "s/Require local/Require all granted/" /etc/httpd/conf.d/wordpress.conf
+            sed -i s/database_name_here/db_name/ /etc/wordpress/config.php
+            sed -i s/username_here/db_user/ /etc/wordpress/config.php
+            sed -i s/password_here/db_password/ /etc/wordpress/config.php
+
+            systemctl restart httpd.service
+            export http_proxy=
+            export https_proxy=
+            curl -s -I http://localhost/wordpress | grep HTTP | awk '{print $2}'
+            wc_notify --data-binary '{"status": "SUCCESS"}'
+          params:
+            db_rootpassword: { get_param: db_root_password }
+            db_name: { get_param: db_name }
+            db_user: { get_param: db_username }
+            db_password: { get_param: db_password }
+            wc_notify: { get_attr: ['wait_handle', 'curl_cli'] }
+      user_data_format: RAW
+
+  association:
+    type: OS::Nova::FloatingIPAssociation
+    properties:
+      floating_ip: { get_resource: wordpress_instance_floating_ip }
+      server_id: { get_resource: wordpress_instance }
+
+  wordpress_dbserver:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image_id }
+      flavor: { get_param: instance_type }
+      key_name: { get_param: key_name }
+      networks:
+          - port : { get_resource: wordpress_dbserver_port }
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash
+
+            # SWUPD INSTALL OR UPDATE TASKS
+            swupd bundle-add database-mariadb network-basic
+            systemctl start mariadb
+
+            # WORDPRESS SOURCES DOWNLOAD AND SETTINGS
+            touch /var/log/mariadb/mariadb.log
+            chown mysql.mysql /var/log/mariadb/mariadb.log
+
+            # Setup MySQL root password and create a user
+            mysqladmin -u root password db_rootpassword
+            cat << EOF | mysql -u root --password=db_rootpassword
+            CREATE DATABASE db_name;
+            GRANT ALL PRIVILEGES ON db_name.* TO "db_user"@"wp_instance"
+            IDENTIFIED BY "db_password";
+            FLUSH PRIVILEGES;
+            EXIT
+            EOF
+
+            export http_proxy=
+            export https_proxy=
+            wc_notify --data-binary '{"status": "SUCCESS"}'
+          params:
+            db_rootpassword: { get_param: db_root_password }
+            db_name: { get_param: db_name }
+            db_user: { get_param: db_username }
+            db_password: { get_param: db_password }
+            wp_instance: { get_attr: [wordpress_instance, first_address] }
+            wc_notify: { get_attr: ['wait_handle', 'curl_cli'] }
+      user_data_format: RAW
+
+
+outputs:
+  WebsiteURL:
+    description: URL for Wordpress wiki
+    value:
+      str_replace:
+        template: http://host/wordpress
+        params:
+          host: { get_attr: [wordpress_instance, first_address] }
+
