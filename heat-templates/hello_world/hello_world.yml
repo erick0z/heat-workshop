@@ -12,7 +12,7 @@ parameters:
   key_name:
     type: string
     description: Name of an existing key pair to use for the server
-    default: generic-cloud
+    default: erick_key
     constraints:
       - custom_constraint: nova.keypair
   flavor:
@@ -36,7 +36,7 @@ resources:
       image: { get_param: image }
       flavor: { get_param: flavor }
       networks:
-          - network: pueblo
+          - network: private
 outputs:
   server_networks:
     description: The networks of the deployed server
